@@ -104,4 +104,444 @@ in all the examples so far, the main loop of most examples has been:
 2. process message
 3. repeat
 
+example of a dirty hack.
+```php
+<?php
+/**
+ * reading from multiple sockets
+ * using a simple recv loop
+ */
+
+ $context = new ZMQContext();
+ $receiver = new ZMQSocket($context, ZMQ::SOCKET_PULL);
+ $receiver->connect("tcp://localhost:5557");
+
+//  connect to weather station
+ $subscriber = new ZMQSocket($context, ZMQ::SOCKET_SUB);
+ $subscriber->connect("tcp://localhost:5556");
+ $subscriber->setSockOpt(ZMQ::SOCKOPT_SUBSCRIBE, "10001");
+
+//  process messages from both sockets
+// we prioritize traffic from the task ventilator
+while(true){
+    try{
+        for ($rc = 0; !$rc;){
+            if($rc = $receiver->recv(ZMQ::MODE_NOBLOCK)){
+                echo "process task";
+            }
+        }
+    } catch(ZMQSocketException $e){
+        echo $e->getMessage();
+    }
+
+    try {
+        for ($rc = 0; !$rc;){
+            if ($rc = $subscriber->recv(ZMQ::MODE_NOBLOCK)){
+                echo "process weather update";
+            }
+        }
+    } catch(ZMQSocketException $e){
+        echo $e->getMessage();
+    }
+    usleep(1);
+}
+```
+issues with the dirty hack is additional latency on the first msg and sleep at the end.
+
+the correct way is to use zmq_poll
+```php
+<?php
+
+/**
+ * reading from multiple sockets by zmq_poll
+ */
+
+$context = new ZMQContext();
+
+//  connect to ventilator
+$receiver = new ZMQSocket($context, ZMQ::SOCKET_PULL);
+$receiver->connect("tcp://localhost:5557");
+
+// connect to weather server
+$subscriber = new ZMQSocket($context, ZMQ::SOCKET_SUB);
+$subscriber->connect("tcp://localhost:5556");
+$subscriber->setSockOpt(ZMQ::SOCKOPT_SUBSCRIBE, "10001");
+
+
+//initialize poll set
+$poll = new ZMQPoll();
+$poll->add($receiver, ZMQ::POLL_IN);
+$poll->add($subscriber, ZMQ::POLL_IN);
+
+
+$readable = $writable = array();
+
+
+while (true) {
+    $events = $poll->poll($readable, $writable);
+    if($events > 0){
+        foreach($readable as $socket){
+            if($socket === $receiver){
+                $msg = $socket->recv();
+                echo "received Rec msg: $msg".PHP_EOL;
+            } elseif ($socket === $writable) {
+                $msg = $socket->recv();
+                echo "received WRT msg: $msg".PHP_EOL;
+            }
+        }
+    }
+}
+```
+
+the items structure has there four members:
+```c
+typedef struct {
+    void *socket; // zmq socket to poll on
+    int fd;       // or, native file handle to poll on
+    short events  // events to poll on
+    short revents; // events returned after poll
+} zmq_pollitem_t;
+```
+
+## Multipart messages
+ zmq lets us compose a message out of several frames, giving us a nultipart message. realistic applications use multipart messages heavily, both for wrapping messages with address information and for simple serialization. will look at reply envelopes later.
+
+
+about multipart messages:
+- when you send a multipart message, the first part(and all following parts) are only actually sent on the wire when you send the final part
+- if you are using `zmp_poll()`, when y ou receive the first part of a message, all the rest has also arrived
+- you will receive ALL part of a message, or NONE at all
+- each part of a message is a separate `zmq_msg` item
+- you will receive all parts of a message whether or not you check the more property
+- on sending, zmq queues message frames in memory until the last is received, then send them all.
+- there is no way to cancel a partially sent message, except by closing the socket.
+
+
+## Intermediaries and Proxies
+
+## The Dynamic discovery  problem
+
+one of the problem you will hit as you design larger distributed architectures is discovery. that is, how do pieces know about each other? it's especially difficult if pieces come and go, so we call this the "dynamic discovery problem"
+
+there  are several solutions to dynamic discovery. the simplest is to entirely avoid it by hardcoding or configuring the network architecture so discovery is done by hand. that is, when you add a new piece, you reconfigure the network to know about it.
+
+> small-scal pub-sub network
+                        Publisher
+                        ---------
+                        PUB
+                        |
+    ______________________________________________              
+    |                |              |            |
+   Sub             Sub             Sub         Sub
+  Subscriber      Subscriber    Subscriber   Subscriber
+
+in practice, this leads to increasingly fragile and unwieldy architectures. let's say you have one publisher and a hundred subscribers. you connect each subscriber to the publisher by configuring a publisher endpoint in each subscirber. that's easy, subcribers are dynamic; the publiher is static. now say you add more publishers. suddenly, it's not so easy any more. if you continue to connect each subscriber to each publisher, the cost of avoiding dynamic discovery gets higher and higher.
+
+> pub-sub network with proxy
+
+ Publisher      Publisher       Publisher       Publisher
+ ---------      ---------       ---------       ---------
+   PUB             PUB             PUB             PUB
+    |               |               |               |
+    |(connect)      |(connect)      |(connect)      |(connect) 
+    |               |               |               |
+    _________________________________________________
+                            |
+                            | bind
+                            |
+                        ----------    
+                        |  XSUB  |
+                        ----------
+                        |  Proxy |
+                        ----------
+                        |  XPUB  |
+                        ----------
+                            |
+                            |(bind)
+                            |
+    _________________________________________________                     |               |               |               |
+    |(connect)      |(connect)      |(connect)      |(connect) 
+    |               |               |               |       
+    SUB             SUB             SUB             SUB
+  Subscirber    Subscirber      Subscirber      Subscirber
+
+
+there are quite a few answers to this, but the very simplest answer is to add an intermediary, that is, a static point in the network to which all other nodes connect. in classic messaging, this is the job of the message broker. zmq doesn't come with a message broker as such, but it lets us build intermediaries quite easily.
+
+you might wonder, if all networks eventually get large enough to need intermediaries, why don't we simply have a messge broker in place for all applications? for beginners, ti's a fiar compromise. just always use a star topology, forget about performance, and things will usually work. however, message brokers are greedy things; in their role as central intermediaries, they become too complex, too stateful and eventually a problem 
+
+it's better to think of intermediaries as simple stateless message switches, a good analogy is an HTTP proxy; it's there, but doesn't have any special role. adding a pub-sub proxy solves the dynamic discovery problem in our example, we set the proxy in the middle of the network. the proxy opens an `XSUB` socket and `XPUB` socket, and binds each to well-know IP address oand prots. then all other processes connect to the proxy, instead of to each other. ti becomes trivial to add more subscribers or publishers.
+
+> Extended pub-sub
+
+ Publisher      Publisher       Publisher       Publisher
+ ---------      ---------       ---------       ---------
+   PUB             PUB             PUB             PUB
+    |               |               |               |
+    |(connect)      |(connect)      |(connect)      |(connect) 
+    |               |               |               |
+    _________________________________________________
+                            |
+                            | bind
+                            |
+                        ----------    
+                        |  XSUB  |
+                        ----------
+                        |**CODE** |
+                        ----------
+                        |  XPUB  |
+                        ----------
+                            |
+                            |(bind)
+                            |
+    _________________________________________________                     
+    |               |               |               |
+    |(connect)      |(connect)      |(connect)      |(connect) 
+    |               |               |               |       
+    SUB             SUB             SUB             SUB
+  Subscirber    Subscirber      Subscirber      Subscirber
+
+we need `XPUB` and `XSUB` sockets becauses zmq does subscirption forwarding from subscribers to publishers. XSUB and XPUB are exactly like SUB and PUB except they expose subscription as special messages. the proxy has to forward these subscription messages from subscriber side to publisher side. by reading them from the XPUB socket and writing them to the XSUB socket. this is the main use case for XSUB and XPUB.
+
+
+## shared Queue( DEALER and ROUTER sockets)
+in t he hellow world client/server application, we have one client that talks to one server. however, in real cases we usually need to allow multiple services as well as multiple clients. this lets us scale up the power of the service(many threads or processes or nodes rather than just one). the only constraint is that services must be stateless, all state being in the request or in some shared storage such as database
+
+> Request Distribution
+
+                        Client
+                         REQ
+                         |
+                         |(R1, R2, R3, R4)
+                         |
+            ---------------------------------
+            |               |               |
+            |R1, R4         |R2             |R3
+            |               |               |
+           REP             REP             REP
+        ServiceA        ServiceB        ServiceC
+
+
+there are tow ways to connect multiple clients to multiple servers. the brute force way is to connect each socket to multiple service endpoints. one client socket can connect to multiple service sockets, and the REQ socket will then distribute requests among these service. let's say you connect a client socket to three service endpoints: A, B and C, the client makes request R1, R2, R3, R4. R1 and R4 go to service A, R2 goes to B, and R3 goes to service C
+
+
+this deisgn lets you add more clients cheaply. you can also add more services, each client will distribute its requests to the services. but each client has to know the service topology. if you have 100 clients and ten you ecide to add three more services, you need to reconfigure and restart 100 clients in order for the clients to know about the three new services.
+
+that's clearly not the kind of thing we want ot be ding at 3 am. when our supercomputing cluster has run out of resources and we desperately need to add a couple of hundred of new service nodes, too many static pieces are like liquid concrete: knowledge is distrbuted and the more static pieces you have, the more effort it is to change the topology. what we want is something sitting in between clients and services that centralizes all knowledge of the topology. ideally, we should be able to add and remove serfvices or clients at any time without touching an y other part of the topology.
+
+so we'll wirte a little message queuing broker that gives us this flexibiligy. the broker binds to two endpoins, a fronted for clients and a backedn for services. it then uses `zmq_poll()` to monitor these tow sockets for activity and when it has some , it shuttles messages between its two socktes. it doen't actually manage any queues explicitly -zmq does that automatically on 4each socket. 
+
+when you user REQ to talk to REP, you get a strictly synchronous request-reply dialog. the client sends a request. the service reads the request and send s a reply. the client then reads the reply. if either the client or the service try to do anything else( sending tow reqquests in a row without waiting for response), they will get an error.
+
+but our broker has to be nonblocking, obviously, we can u se `zmq_poll()` to wait for activity on either socket, but we can't use REP and REQ.
+
+
+> Extended Request-Reply
+
+   REQ             REQ             REQ             REQ
+    |               |               |               |
+    _________________________________________________
+                            |
+                            | 
+                            |
+                        ----------    
+                        | ROUTER |
+                        ----------
+                        |**CODE**|
+                        ----------
+                        | DEALER |
+                        ----------
+                            |
+                            |
+    _________________________________________________                     
+    |               |               |               |       
+    REP            REP             REP             REP
+
+luckily, there are two sockets called DEALER and ROUTER that let you do nonblocking requrest-response. you'll see later on how DEALER and ROUTER sockets let you build all kinds of asynchronous request-reply flows. for now, we 're just going to see how DEALER and ROUGER let us extend REQ-REP across an intermediary, that is, our little broker.
+
+in this simple extended request-reply pattern, `REQ` talks to `ROUTER` and `DEALER` talks to `REP`. in between the DEALER and ROUTER, we have to have code(like our broker) that pulls messages off the one socket and shoves them  onto the other.
+
+the request-reply broker binds to two endpoints, one for clients to connect to (the frontend socket) and one for workers to connect to (the backend) to test this broker, you will want to change your workers so they connect to the backend socket. *see request_reply_client.php, request_reply_worker.php, request_reply_broker.php*  **currently not working, not don't why yet...(the object id not match) the subscriber need ZMQ::SOCKOPT_SUBSCRIBE set up(?)**
+
+## zmq Built-in Proxy function
+
+it turns out the core loop in the previous section's rrbroker is very useful, and resusable. it lets us build pub-sub forwarders and shared queues and other little intermediaries with very little effort. zmq warps this up in a single method `zmq_proxy()`
+
+`zmq_proxy(frontend, backend, capture);`
+
+the two(or three sockets, if we want to capture data) must be properly connected, bound, and configured. when  we call the `zmq_proxy` method, it's exactly like starting the main loop of rrbroker. le's rewrite the request-reply broker to call zmq_proxy, and re-badge this as an expensive-sounding "message queue" (people have chared houses for code that di less):
+```php
+<?php
+/**
+ * msgqueue.php
+ * simple message queuing broker
+ * same as request-reply broker but using QUEUE device
+ */
+
+ $context = new ZMQContext();
+
+//  socket facing clients
+ $frontend = $context->getSocket(ZMQ::SOCKET_ROUTER);
+ $frontend->bind("tcp://*:5559");
+
+//  socket facing service
+$backend = $context->getSocket(ZMQ::SOCKET_DEALER);
+$backend->bind("tcp://*:55560");
+
+// start built-in device
+$device = new ZMQDevice($frontend, $backend);
+$device->run();
+```
+
+if you're like most zmq users, at this stage your mind is starting to think, what kind of evil stuff can I do if I pulg random socket types into the proxy?  the short answer is: try it and work out what is happening, in practice, you would usually stick to ROUTER/DEALER, XSUB/XPUB, or PULL/PUSH.
+
+
+### transport bridging
+a frequent request from zmq users is "how do i connect my zmq network with technology X?" where X is some other networking or messaging technology.
+
+> Pub-Sub forwarder proxy
+
+
+                        Publisher
+                           PUB
+                bind tcp://localhost:5556
+                            |
+                            |
+    --------------------------------------------
+    |              |                           |
+   SUB            SUB                         XSUB
+                                             Proxy
+                                             XPUB
+   internal  network                          |
+   __________________________________________ |
+    External network                          |
+                                      bind: tcp://10.1.1.1:8100
+                                             |
+                                             |
+                                   ----------------------
+                                   |                    |
+                                  SUB                  SUB           
+
+
+
+the simple answer is to build a bridge. a bridge is a small application that speaks one protocol at one socket, and converts to/from a second protocol at another socket. a protocol interpreter, if you like. a common bridging problem in zmq is to bridge two transports or networks
+
+as an example, we're going to write a little proxy that sits in between a publisher and a set of subscribers, bridging two networks. the frontend socket (SUB) faces the internal network where the weather server is sitting, and the backend(PUB) faces subscribers on the external network. it subscribes to the weather service on the frontend socket, and republishes its data ont he backend socket. (`proxy.php`)
+
+```php
+<?php
+
+/**
+ * proxy.php
+ * weather proxy device
+ */
+
+$context = new ZMQContext();
+
+// this is where the weather server sits
+$frontend = new ZMQSocket($context, ZMQ::SOCKET_SUB);
+$frontend->connect("tcp://192.168.55.210:5556");
+
+// this is our public endpoint for subscirbers
+$backend = new ZMQSocket($context, ZMQ::SOCKET_PUB);
+$backend->bind("tcp://10.1.1.0:8100");
+
+// subscribe on everything;
+$frontend->setSockOpt(ZMQ::SOCKOPT_SUBSCRIBE, "");
+
+// or may be can use build-in proxy function ZMQDevice()?
+// // start built-in device
+// $device = new ZMQDevice($frontend, $backend);
+// $device->run();
+
+// shunt message out to our own subscirbers
+while (true) {
+    while(true){
+        // process all parts of the message
+        $msg = $frontend->recv();
+        $more = $frontend->getSockOpt(ZMQ::SOCKOPT_RCVMORE);
+        $backend->send($msg, $more ? ZMQ::MODE_SNDMORE : 0);
+        if(!$more){
+            break; // last msg part
+        }
+    }
+}
+```
+
+it looks very similar to the earlier proxy example, but the key part is that the frontend and backend sockets are on two different newwroks. we can use this model for example to connect a multicast network (pgm transoprt) or a tcp publiser
+
+
+### Handling Errors and ETERM
+
+zmq error handling philosophy is a mix of fail-fast and resilience. Processes, we believe, should be as vulnerable as po9ssible to internal errors, and as robust as possible against external attacks and errors. to give an analogy, a living cell will self-destruct if it detects a single internal error, yet it will resist attack from the ourside by all means possible.
+
+assertions, which pepper the zmq code, are absolutely vital to robust code; they just have to be on th right side of the cellular wall. and there should be such a wall. if ti is unclear whether a fault is internal or external, that is a design flow to be fixed. in c/c++, assertions stop the application immediately with an error. in other languages, you may get exceptions or halts.
+
+when zmq detects an external fault it returns an error to the calling code. in some rare cases, it drops messagers silently if there is no obvious strategy for recovering from the error.
+
+in most of the C examples we've seen so far ther's been no error handling. Real Code Should do error handling on every single zmq call. if your're using a language being other than C, the binding may handle errors for you. in  C, you do need to do this y ourself. there are some simple rules, starting with POSIX conventions:
+- methods that create objects return NULL if they fail
+- methods that process data may return the number of bytes processed, or -1 on an error or failure
+- other method return 0 on success and -1 on an error or failure
+- the error code is provided in errno or `zmq_errno()`
+- a descriptive error text for logging is provided by `zmq_strerror()`
+
+for example 
+```c
+void *context = zmq_ctx_new();
+assert(context);
+void $socket = zmq_socket(context, ZMQ_REP);
+assert (socket)
+int rc = zmq_bind(socket, "tcp://*:5555");
+if(rc == -1) {
+    printf("E: bind failed: %s\n", strerror(errno));
+    return -1;
+}
+
+```
+there are two main exceptional conditions that you should handle as nonfatal:
+- when your code receives a message with the `ZMQ_DONTWAIT` option and there is no waiting data, zmq will return -1 and set errno to `EAGAIN`
+- when one thread calls `zmq_ctx_destory()`, and other threads are still doing blocking work, the `zmq_ctx_destory()` call closes the context and all locking calls exit with -1 and errno set to `ETERM`
+
+in C/C++ asserts can be removed entirely in optimized code, so don't make the mistake of wrapping t he whole zmq call in an assert(). it looks neat; then the optimizer removes all the asserts and the calls you want to make, and your application breaks in impressive ways.
+
+
+> Parallel pipeline with kill signaling
+
+![kill](https://zguide.zeromq.org/images/fig19.png)
+
+let's see how to shut down a process cleanly. we'll take the parallel pipeline example from the previous section. if we've started a whole lot of workers in the backgroud, we now want to kill them when the batch is finished. let's do this by sending a kill message to the workers. the best place to do this is the sink because it really knows when the batch is done.
+
+how do we connect the sink to the workers? the PUSH/PULL sockets are one-way only. we could swtich to anotehr socket type, r we could mix multiple socket flows. lets try tht elatter: using a pub-sub model to send kill messages to the works:
+- the sink creats a PUB socket on a new endpoint.
+- workers connect their input socket to this endpoint
+- when the sink detects the end of the batch, it send s a kill to it's pub socket.
+- when a worker detects this kill message it exits.
+
+it doesn't take much new code in the sink
+```c
+void *controller = zmq_socket(context, ZMQ_PUB);
+zmq_bind(controller, "tcp://*.5559);
+...
+//send kill signal to workers
+s_send(controller, "KILL");
+```
+
+here is the worker process, which manges two sockets(a PULL socket getting task, and a SUB socket getting control commands), using the `zmq_poll()` technique we saw earlier: (taskWork2.php taskSink2.php) 
+> still can not receive KILL msg
+
+## Handling interrupt signals
+realistic applications need to shu down cleanly when interrupted with Ctrl-C or another singal such as SIGTERM. by default, these simply kill the process, meaning messages won't be flushed, files won't be closed cleanly and so on.
+
+here is how we hanlde a signal in various languages  `interrupt.php`
+
+the program provides s_catch_signals(), which traps Ctrl-C (`SIGINT`) and `SIGTERM` when either of these signals arrive, the `signalHandler()` handler sets the global variable `$running` to `false`. thanks to your signal handler, you application will not die automatically. instead, you have a chance to clean up and exit gracefully. you have to now explicitly check for an interrupt and handle it properly. do this by calling `signalHandler()` at the start of your main code. this sets up the signal handling. the interrupt will affect zmq calls as follows:
+- if your code blocking in a blocking call(sending a message, receiving a message, or polling), then when a signal arrives, the call will return with `EINTR`
+- wrappers like `s_recv()` return `NULL` if they are interrupted
+
+so check for an `EINTR` return code, a `NULL` return and/or `s_interrupted`
+
+if you call `signalHandler()` and on't test for interrupts, then your application will become immue to Ctrl-C and `SIGTERM` which may be useful but is usually not.
+     
+
 https://zguide.zeromq.org/docs/chapter2/

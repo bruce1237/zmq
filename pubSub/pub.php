@@ -1,6 +1,6 @@
 <?php
 $context = new ZMQContext();
-$publisher = $context->getSocket(ZMQ::SOCKET_PUB);
+$publisher = new ZMQSocket($context, ZMQ::SOCKET_PUB);
 $publisher->bind("tcp://*:5556");
 // $publisher->bind("ipc://weather.ipc");
 
