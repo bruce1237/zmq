@@ -2,7 +2,7 @@
 
 push (R1, R2, R3) ----
                       |
-push (R4) --------------->fair Queuing(R1, R4, R5, R2, R6, R3)--->PULL
+push (R4) ---------------> fair Queuing(R1, R4, R5, R2, R6, R3)--->PULL
                       |
 push (R5, R6) --------
 
