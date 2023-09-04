@@ -543,5 +543,5 @@ so check for an `EINTR` return code, a `NULL` return and/or `s_interrupted`
 
 if you call `signalHandler()` and on't test for interrupts, then your application will become immue to Ctrl-C and `SIGTERM` which may be useful but is usually not.
      
-
+## Detecting Memory Leaks
 https://zguide.zeromq.org/docs/chapter2/
