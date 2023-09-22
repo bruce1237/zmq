@@ -1,7 +1,7 @@
 <?php
 $context = new ZMQContext();
 $publisher = new ZMQSocket($context, ZMQ::SOCKET_PUB);
-$publisher->bind("tcp://*:5556");
+$publisher->connect("tcp://localhost:5556");
 // $publisher->bind("ipc://weather.ipc");
 
 $count = 0;

@@ -544,4 +544,119 @@ so check for an `EINTR` return code, a `NULL` return and/or `s_interrupted`
 if you call `signalHandler()` and on't test for interrupts, then your application will become immue to Ctrl-C and `SIGTERM` which may be useful but is usually not.
      
 ## Detecting Memory Leaks
+
+any long-running application has to manage memory correctly, or eventually it'll use up all available memory and crash. if you use a language that handles this automatically for you, congratualations. I using PHP, so skip
+
+## Multithread 
+please see Multithreading/multithread.md
+
+## Node coordination
+when you want to coordinate a set of nodes on a network, PAIR sockets won't work well any more. this is one of the few areas where the strategies for threads and nodes are different. Principally, nodes come and go whereas threads are usually static. PAIR sockets do not automatically reconnect if the remote node goes away and comes back.
+![Alt text](<Screenshot 2023-09-20 at 23.10.08.png>)
+the second signficant difference between threads and nodes is that you typically have a fixed number of threads but a more variable number of nodes. let's take one of our earlier scenarios(the weather server and clients) and use node coordination to ensure that subscribers don't lose data when starting up.
+
+this is how the applicaiton will work:
+- the publisher knows in advance how many subscribers it expects. this is just a magic number it gets from somewhere
+- the publisher starts up and waits for all subscribers to connect. this is the node coordination part. each subscriber subscribes and then tells the publisher it's ready via another socket.
+- when the publisher has all subscribers connected, it starts to pusblish data
+
+in this case, we'll use REQ_REP socket flow to synchronize subscribers and publisher. 
+
+`syncpub.php`
+`syncsub.php`
+
+we can't assume that the SUB connect will be finished by the time the REQ?REP dialog is complete. there are no guarantees that outbound connects will finish in any order whatsoever, i f you're using any transport except inproc. so the example does a brute force sleep of tone second between subscribing, and sending the REQ/REP synchronizaiton.
+a more robust model could be:
+- publisher opens pub sockett and starts sending "hello" message (not data)
+- subscribers connect SUB socket and when they receive a hello message they tell the publisher via a REQ/REP socket pari
+- when the publisher has had all the necessary confirmations, it starts to send real data.
+
+## ZERO-COPY
+ZMQ's message API lets you send and receive messages directly form and to application buffers without copying data. it's called zero-copy. and it can improve performance in some applications.
+
+you should think about using z-copy in the specific case where you are sending large blcoks of memory(thousands of bytes), at a high frequency. for short messages, or lower messge rates, using z-copy will make your code messier and more complex with no meansurable benefit. measure befor and after.
+
+to do z-copy, you use `zmq_msg_init_data()` to create a message that refers to a block of data already allocated with `mallco()` or some other allocator, and then you pass that to `zmq_msg_send()`. when you create the message, you also pass a function that zmq will call to free the block of data, when it has finished sending the message this is the simplest example, assuming buffer is a block of 10000 bytes allocated on the heap:
+
+```c
+void my_free(void *data, void *hint) {
+    free(data)
+}
+// send message from buffer, which we allocated and zmq will free for us
+zmq_msg_t message;
+zmq_msg_init_data(&message, buffer, 1000, my_free, NULL);
+zmq_msg_send(&message, socket, 0);
+```
+
+>note you don't call `zmq_msg_close()` after sending a message-libzmq will do this automatically when it's actually done sending the message.
+
+there is no way to do z-copy on receive: zmq delivers you a buffer that you can store as long as you wish, but it will not write data dirctly into application buffers.
+
+on writing, zmq's multipart messages work nicely together with z-copy. in traditional messaging, you need to marshal different buffers together into one buffer that you can send. that means copying data. with zmq, you can send multiple buffers coming from different sources as individual message frames. send each field as a length-delimited frame. to the application, it looks like series of send and receive calls. but internally, the multiple parts get written to the network and read back with single system calls, so it's very efficient.
+
+## Pub-Sub message envelops
+in the pub-sub pattern, we can split the key into a separate message frame that called an envelop. if you want to use pub-sub envelops, make them yourself. it's optional.
+
+![pub-sub envelop with separate key](<Screenshot 2023-09-21 at 09.24.34.png>)
+
+subscriptions do a prefix match. that is, they look for all messages starting with XYZ. the obvious question is: how to delimit keys from data so that the prefix match doesn't accidentally match data. the best answer is to use an envelop because the match won't cross a frame boundary. here is a minimalist example of how pub-sub envelops look in code.
+
+this publisher sends messages of two types, A and B
+`psenvpub.php`
+`psenvsub.php`
+
+when you run, you should see this:
+```text
+[B] We would like to see this
+[B] We would like to see this
+[B] We would like to see this
+...
+```
+
+this example shows that the subscription filter rejects or accepts the entire multipart message(key plus data). you won't get part of a multipart message, ever. if you subscribe to multiple publishers and you want to know their address so that you can send them data via another socket(and this is a typical use case), create a three-part message
+![pub-sub envelop with sender address](<Screenshot 2023-09-21 at 09.38.22.png>)
+
+```php
+$publisher->send("Address Of PUB SERVER", ZMQ::MODE_SNDMORE);
+```
+
+## high-water marks
+
+when you can send messages repaidly from process to process, you soon discover that memory is a precious resource, and one that can be trivially filled up. a few seconds of delay somewhere in a process can turn into a backlog that blows up a server unless you understand the problem and take precautions.
+
+the problems is this: imagine you ahve process A sending messages at high frequency to process B, which is processing them. Suddenly B gets very busy and can't process themessges fro a short period. what happens to the messages that process A is still trying to send frantically? some will sit in B's network buffers. some will sit on the Ethernet wire itself. some will sit in A's network buffers.a dn the rest will accumulate in A's memoery, as rapidly as the application behaind A sends them. if you don't take some precaution, A can easily run out of memoery and crash.
+
+what are the answers? one is to pass the problem upstream. A is getting the messages from somewhere else. so tell that process, "STOP", and so on. this is called `flow control`.
+
+flow control works in some cases, but not in others. the transport layer can't tell the application layer to "stop" any more than a subway system can tell a large business to keep working. the answer for messaging is to set limits on the size of buffers, and then when we reach those limits, to take some sensible action. in some cases the answer is to throw away messages, in others, the best strategy is to wait.
+
+zmq uses the concept of HWM(high-water-mark) to define the capactity of its internal pipes. each connection out of socket or into a socket has its own pipe. and HWM for sending and/or receiving, depending on the socket type. PUB PUSH only have send buffers. SUB PULL, REQ, REP only have receive buffers. DEALER, ROUTER PARI have both send and receive buffers.
+
+in zmq 3.x HWM set to 1000 by default. when socket reaches its HWM, it will either `block` or `drop` data depending on the socket type. PUB ROUTER will drop data while other socket types will block. over the inproc transport, the sender and receiver share teh same buffers, so the real HWM is the sum of the HWM set by both side.
+
+Lastly, the HWM are not exact; while you may get up to 1000 messages by default, the real buffer size may be much lower(as little aas half) due to the way libzmq implements its queues.
+
+
+## misssing message problem solver
+
+as you build applicaton with zmq, you will come across this problem more than once; lossing messages that you expect to receive. 
+
+the most common causes:
+![missing message solve road map](image.png)
+
+
+- On SUB socket, set a subscription using `zmq_setsockopt()` with `ZMQ_SUBSCRIBE`, or you won't get messages. because you subscribe to message by prefix, if you subscribe to ""(and empty subscription), you will get everything.
+- if you start the SUB socket(i.e., establish a connection to a PUB socket) after the PUB socket has started sending out data, you will lose whatever it published before the connectionwaas made. if this is a probem, set up your architecutre so teh SUB socket starts first, then the PUB socket starts publishing.
+- even if you synchronize a SUB and PUB socket, you may still lost messages. it's due to the fact that internal queues aren't created until a connection is actually created. if you can switch the bind/connect direction so the SUB socket binds and the PUB socket connects, you may find it works more as you'd expect.  <tried, still the first one is miising>
+- if you're using REP and REQ sockets, and your're not sticking to the synchronous send/recv/send/recv order, zmq will report errors, which you might ignore. then it would look like you're losing messages. if you use REQ or REP, stick to the send/recv order, and alwasys inreal code, check for errors on zmq calls
+- if you're using PUSH sockets, you'll find that the first PULL socket to connect will grab an unfair share of messages. the accurate rotation of messages only happens when all PULL sockets are successfully connected, which can take some milliseconds. as an alternative to PUSH/PULL, for lower data rates, consider using ROUTER/DEALER and the load balancing pattern.
+- if you're sharing sockets across threads, don't. it will lead to random weirdness and crashes.
+- if you're using inproc, make sure both sockets are in the same context. otherwise the connecting side will in fact fail. also, bind first, then connect. inproc is not a disconnected transport like tcp.
+- if you're using ROUTER sockets, it's remarkably easy to lose messages by accident, by sending malformed identify frames(or forgetting to send an identity frame). in general setting the `ZMQ_ROUTER_MANDATORY` option on ROUTER sockets is a good idea, but do also check the return codeo on every send call.
+- lastly, if you really can't figure out what's going wrong, make a minimal test case that reproduces the probelm and askfor help.
+- 
+
+
+
+
 https://zguide.zeromq.org/docs/chapter2/
