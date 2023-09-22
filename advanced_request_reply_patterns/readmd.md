@@ -130,8 +130,40 @@ and when we receive a message, we:
 2. receive the next frame and pass that to the application.
 
 ## the REQ and ROUTER combination
+in the same way that we can replace REQ with DEALER, we can replace REP with ROUTER. this gives us an asynchronous server that can talk to multiple REQ clients at the same time. if we rewrote the "hello world" service using Router, we'd be able to process any number of "hello" reuests in parallel. 
 
+we can use Router in two distinct ways:
+- as a proxy that switches messages between frontend and backend sockets
+- as an application that reads the message and acts on it.
 
+in the first case, the ROUTER simply reads all frames, including the artificial identity frame, and passes them on blindly. in the second case the ROUTER must know the format of the reply envelop it's being sent. as the other peer is a REQ socket, the ROUTER gets the identity frame, an empty frame, and then the data frame.
+
+## the DEALER to ROUTER combination
+now we can switch out bother REQ and REP with DEALER and ROUTER to get the most powerful socket combination, which is DEALER talking to ROUTER. it gives us asynchronous clients talking to asynchronous servers, where both side have full control over the message formats.
+
+because both DEALER and ROUTER can work with arbitrary message formats, if you hope to use these safely, you have to become a little bit of a protocol designer. at the very least you must decide whether you with to emulate the REQ/REP reply envelop. it depends on whether you actually need to send replies or not.
+
+## the ROUTER to ROUTER combination
+this sounds perfect for N-to-N connections, but it's the most difficult combination to use. you should avoid it untill well advanced.
+
+![connection summary](3C84A47A-9989-49E7-8CB9-F0F19A6F7FE9_1_102_o.jpeg)
+
+## Invalid Combinations
+### REQ to REQ
+both side want to start by sending messages to each other, and this could only work if you timed thins so that both peers exchanged messages at the same time. it hurts my brain to even think about it.
+
+### REQ to DEALER
+you could in theory do this, but it would break if you added a second REQ because DELER has no way of sending a reply to the original peer. thus the REQ socket would get confused, and/or return messages meant for another client.
+
+### REP to REP
+both side would wait for the other to send the first message
+
+### REP to ROUTER
+the ROUTER socket can in theory initiate the dialog and send a properly-formatted request, if it knows the REP socket has connected and it knows the identity of that connection. it's messy and adds nothing over DEALER to ROUTER
+
+the common thread in this valid versus invalid breakdown is that a zmq socket connection is always biased towards one peer that binds to an endpoint, and another that connects to that. further, that which side binds and which side connects is not arbitrary, but follows natural patterns. the side which we expected to be there binds: it'll be a server, a broker, a publisher, a collector. the side that comes and goes "connects": it'll be clients and workers. remembering this will help you design better zmq architectures
+
+## Exploring ROUTER Sockets
 
 
 https://zguide.zeromq.org/docs/chapter3/
