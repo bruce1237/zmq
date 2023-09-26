@@ -1,0 +1,9 @@
+{
+    "name": "root/advanced_request_reply_patterns",
+    "autoload": {
+        "psr-4": {
+            "Root\\AdvancedRequestReplyPatterns\\": "src/"
+        }
+    },
+    "require": {}
+}
