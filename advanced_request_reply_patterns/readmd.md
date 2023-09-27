@@ -537,7 +537,11 @@ there are few possibilities, each with pros and cons:
 - clients could connect directly to bother brokers. the advantage is that we don't need to modify brokers or workers. but clients get more complex and become aware of the overall topology. if we want to add a third or forth cluster, for example, all the clients are affected. in effect we have to move routing and failover logic into the clients and that's not nice.
 - workers might connect directly to both brokers. but REQ workers can't do that, they can only reply to one broker. we might use REPs but REPs don't give us customizable broker-to-worker routing like load balancing does. only thje built-in load balancing. that's a fail. if we want ot distribute work to idle workers, we precisely need load balancing. one solution would be to use ROUTER sockets for the wokrer nodes. let's lable this 'Idea #1'
 - brikers could connect to each other. this looks neatest because it creates the fewest additional connects. we can't add clusters to the fly, but that is probably out of scope. now clients and workers remain ignorant of the real network topology, and brokers tell each othjer when they have spare capacity. let's label this 'iead #2'
-- 
+
+#### let's explore idea #1. 
+in this model, we have workers connecting to bother borkers and accepting jobs from either one.
+
+![Idea 1: Cross-connected workers](image-15.png)
 
 
 

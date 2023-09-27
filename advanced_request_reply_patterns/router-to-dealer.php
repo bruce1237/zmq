@@ -63,7 +63,7 @@ sleep(1);
 
 // send 10 tasks scatted to A twice as often as B
 for ($task_nbr = 0; $task_nbr<10; $task_nbr++){
-    if(mt_rand(0,2)>0){
+    if($task_nbr%2==0){
         $client->send("A", ZMQ::MODE_SNDMORE);
     }else{
         $client->send('B', ZMQ::MODE_SNDMORE);
