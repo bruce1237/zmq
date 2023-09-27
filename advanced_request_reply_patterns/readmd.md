@@ -456,5 +456,89 @@ if you're using child threads, they won't receive the interrupt. to tell them to
 - send them shutdown messages, if they are using their own contexts, for this you'll need some socket plumbing.
 
 ## The Asynchronous Client/Server Pattern
+in the ROUTER to DEALER example, we saw a 1-to-N use case where one server talks asynchronously to multiple workers. we can turn this upside down to get a very useful N-to-1 architecture where various clients talk to a single server, and do this asynchronously.
+
+![Asynchronous Client/Server](image-11.png)
+
+here is how it works:
+- clients connect to the server and send requests
+- for each request, the server send 0 or more replies
+- clients can send multiple requests without waiting for a reply
+- servers can send multiple replies without waiting for new requests
+
+here's code that shows how this works
+
+`asynchronous-Nclient-1server.php`
+
+the example runs in one process, with multiple threads simulating a real multiprocess architecture. when you run the example, you'll see three clients(each with a random ID), printing out the replies they get from the server. look carefully and you'll see each client task gets 0 or more replies per request.
+
+some comments on this code:
+- the clients send a request once per second, and get zero or more replies back. to make this work using `zmq_poll()`, we can't simply poll with a 1-second timeout, or we'd end up sending a new reuqest onlly one second after we received the last reply. so we poll at a high frequency(100 times at 1/100th of a second per poll), which is approximately accurate.
+- the server uses a pool of worker threads, each processing one request synchronlusly. it connects these to its frontend socket using an internal queue. it coonnects the frontend and backend sockets using a `zmq_proxy()` call.
+
+![Detail of Asynchronous server](image-12.png)
+
+note that we're doing DEALER to ROUTER dialog between client and server, but internally between the server main thread and workers, we're doing DEALER to DEALER. if the workers were strictly synchronous. we'd use REP. however, because we want to send multiple replies, we need an async socket. we do not want to route replies, they always go to the single server thread that sent us the request.
+
+let's think about the routing envelope. the client send a message consisting of a single frame. the server thread receives a two-frame message(original message prefixed by client identity). we send these two frames on to the worker, which treats it as a normal reply envelope, returns that to use as a two frame message. we then use the first frame as an identity to route the second frame back to the client as a reply.
+
+it looks something like this:
+
+     client          server       frontend       worker
+   [ DEALER ]<---->[ ROUTER <----> DEALER <----> DEALER ]
+             1 part         2 parts       2 parts
+
+now for the sockets: we could use the load balancing ROUTER to DEALER pattern to talk to workers, but it's extra work. in this case, a DEALER to DEALER pattern is probably fine: the trade-off is lower latency for each request, but higher risk of unbalanced work distribution. simplicity wins in this case.
+
+when you bind servers that maintain stateful conversations with clients, you will run into a classic problem. if the server keeps some state per client, and clients keep coming and going, eventually it will run out of resources. even if the same clients keep connecting, if you're using default identities, each connection will look like a new one.
+
+we cheat in the above example by keeping state only for a very short time(the time it takes a worker to process a request) and then throwing away the state. but that's not practical for many cases. to properly manage client state in a stateful asynchronous server, you have to :
+- do heart beating from client to server. in our example, we send a request once per second, which can reliably be used as a heartbeat
+- store state using the client identity(whether generated or explicit) as key
+- detect a stopped heartbeat. if there's no request from a client within, sya, two seconds, the server can detect this and destory any state it's holding for that client.
+
+## worked example: inter-broker routing
+let's take everything we've seen so far, and scale things up to a real application. we'll build this step-by-step over several iterations. our best client calls us urgently and asks for a design of a large cloud computing facility. he has this vision of a cloud that spans many data centers, each a cluster of clients and workers, and that works together as a whole. because we're smart enough to know  that practice always beats theory, we propose to make a working simulation using zmq. our client, eager to lock down the budget before hsi own boss changes his mind, and having read great things about zmq.
+
+### establishing the details
+several espressos later, we want to jump into writing code, but a little voice tells us to get more details before making a sensational solution to entirely the wrong problem. "what kind of work is the cloud doing?" we ask.
+
+the client explains:
+- workers run on various kinds of hardware, but they are all able to handle any task. there are several hundred workers per cluster, and as many as a dozen clusters in total.
+- clients create tasks for workers. each task is na independent unit of work and all the client wants is to find an available worker, and sent it the task, as soon as possible. there will be a lot of clients and they'll come and go arbitrarily.
+- the real difficulty is to be able to add and remove clusters at any time. a cluster can leave or join the cloud instantly, bringing all its workers and clients with it.
+- if there are no workers in their own cluster, clients' task will go off to other available workers in the cloud.
+- clients send out one task at a time, waiting for a reply. if they don't get an answer within X seconds, they'll just send out the task again. this isn't our concern; the client API does it already.
+- workers process one task at a time; they are very simple beasts. if they crash, they get restarted by whatever script started them.
+
+so we double-check to make sure that we understood this correctly:
+- there will be some kind of super-duper network interconnect between clusters, right?", client answered "yes"
+- what kind of volumes are we talking about? client replies: up to a thousand clients per cluster, each doing at most ten requests per second. requests are small, and replies are also small, no more than 1K bytes each
+
+so we do a little calculation and see that this will work nicely over plain TCP. 2500 clients x 10/second x 10000 bytes x 2 directions = 50MB/Sec or 400Mb/sec, not a problem for a 1Gb network
+
+it's a straightforward problem that requires no exotic hardware or protocols, just some clever routing algorithms and careful design. we start by designing one cluster(one data center) and then we figure out how to connect clusters together.
+
+### architecture of a single cluster
+workers and clients are synchronous. we want to use the load balancing pattern to route tasks to workers. workers are all identical; our facility has no notion of different services. workers are anonymous; clients never address them directly. we make no attempt here to provide guaranteed delivery, retry and so on.
+
+for reasons we already examined, clients and workers won't speak to each other directly. it makes it impossible to add or remove nodes dynamically. so our basic model consists of the request-reply message broker we saw earlier.
+
+![Cluster architecture](image-13.png)
+
+### scaling to multiple clusters
+now we scale this out to more than one cluster. each cluster has a set of clients and workers, and a broker that joins these together.
+
+![Multiple clusters](image-14.png)
+
+the question is: how do we get the clients of each cluster talking to the workers of the other cluster?
+there are few possibilities, each with pros and cons:
+
+- clients could connect directly to bother brokers. the advantage is that we don't need to modify brokers or workers. but clients get more complex and become aware of the overall topology. if we want to add a third or forth cluster, for example, all the clients are affected. in effect we have to move routing and failover logic into the clients and that's not nice.
+- workers might connect directly to both brokers. but REQ workers can't do that, they can only reply to one broker. we might use REPs but REPs don't give us customizable broker-to-worker routing like load balancing does. only thje built-in load balancing. that's a fail. if we want ot distribute work to idle workers, we precisely need load balancing. one solution would be to use ROUTER sockets for the wokrer nodes. let's lable this 'Idea #1'
+- brikers could connect to each other. this looks neatest because it creates the fewest additional connects. we can't add clusters to the fly, but that is probably out of scope. now clients and workers remain ignorant of the real network topology, and brokers tell each othjer when they have spare capacity. let's label this 'iead #2'
+- 
+
+
 
 https://zguide.zeromq.org/docs/chapter3/
