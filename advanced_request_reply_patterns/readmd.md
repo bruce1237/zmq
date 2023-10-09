@@ -535,13 +535,81 @@ the question is: how do we get the clients of each cluster talking to the worker
 there are few possibilities, each with pros and cons:
 
 - clients could connect directly to bother brokers. the advantage is that we don't need to modify brokers or workers. but clients get more complex and become aware of the overall topology. if we want to add a third or forth cluster, for example, all the clients are affected. in effect we have to move routing and failover logic into the clients and that's not nice.
-- workers might connect directly to both brokers. but REQ workers can't do that, they can only reply to one broker. we might use REPs but REPs don't give us customizable broker-to-worker routing like load balancing does. only thje built-in load balancing. that's a fail. if we want ot distribute work to idle workers, we precisely need load balancing. one solution would be to use ROUTER sockets for the wokrer nodes. let's lable this 'Idea #1'
-- brikers could connect to each other. this looks neatest because it creates the fewest additional connects. we can't add clusters to the fly, but that is probably out of scope. now clients and workers remain ignorant of the real network topology, and brokers tell each othjer when they have spare capacity. let's label this 'iead #2'
+- workers might connect directly to both brokers. but REQ workers can't do that, they can only reply to one broker. we might use REPs but REPs don't give us customizable broker-to-worker routing like load balancing does. only the built-in load balancing. that's a fail. if we want ot distribute work to idle workers, we precisely need load balancing. one solution would be to use ROUTER sockets for the worker nodes. let's label this 'Idea #1'
+- brokers could connect to each other. this looks neatest because it creates the fewest additional connects. we can't add clusters to the fly, but that is probably out of scope. now clients and workers remain ignorant of the real network topology, and brokers tell each other when they have spare capacity. let's label this 'idea #2'
 
 #### let's explore idea #1. 
 in this model, we have workers connecting to bother borkers and accepting jobs from either one.
 
 ![Idea 1: Cross-connected workers](image-15.png)
+
+
+it looks feasible. however, it doesn't provide what we wanted, which was that clients get local workers if possible and remote workers only if it's better than waiting. also workers will signal "ready" to both brokers and can get two jobs at one, while other workers remain idle. it seems this design fails because again we're putting routing logic at the edges.
+
+so, Idea #2 then, we interconnect the brokers and don't touch the clients or workers, which are REQs like we're used to.
+
+![Idea 2: Brokers talking to each other](image-16.png)
+
+this design is appealing because the problem is solved in one place, invisible to the rest of the world. basically, brokers open secret channels to each other and whisper, like camel traders, "Hey, I've got some spare capacity. if you have too many clients, give me a shout and we'll deal".
+
+in effect it is just a more sophisticated routing algorithm: brokers become subcontractors for each other. there are other things to like about this design, even before we play with real code:
+- it treats the common case (clients and workers on the same cluster) as default and does extra work for the exceptional case(shuffling jobs between clusters).
+- it lets us use different message flows for the different types of work. that means we can handle them differently, e.g., using different types of network connection
+- it feels like it would scale smoothly. interconnecting three or more brokers doesn't get overly complex. if we find this to be a problem, it's easy to solve by adding a super-broker.
+
+we'll now make a worked example. we'll pack an entire cluster into one process. that is obviously not realistic, but it makes it simple to simulate, and the simulation can accurately scale to real processes. this is the beauty of ZMQ - you can design at the micro-level and scale that up tot he macro-level. threads become processes, and then become boxes and the patterns and logic remain the same. each of our "cluster" processes contains client threads, worker threads and a broker thread.
+
+we know the basic model well by now:
+
+- the REQ client(REQ) threads create workloads and pass them to the broker(ROUTER)
+- the REQ worker(REQ) threads process workload and return the results to the broker(ROUTER)
+- the broker queues and distributes workloads using the load balancing pattern.
+
+### Federation Versus Peering
+there are several possible ways to interconnect brokers. what we want is to be able to tell other brokers "we have capacity", and then receive multiple tasks. we also need to be able to tell other brokers, "stop , we're full". It doesn't need to be perfect; sometimes we may accept jobs we can't process immediately, then we'll do them as soon as possible.
+
+
+#### Federation
+the simplest interconnect if **Federation**, in which brokers simulate clients and workers for each other. we would do this by connecting our frontend to the other broker's backend socket. note that it is legal to both bind a socket to an endpoint and connect it to other endpoints.
+
+![Cross-connected brokers in Federation Model](image-17.png)
+
+this would give us simple logic in both brokers and a reasonable good mechanism: when there are no workers, tell the other broker "ready", and accept one job from it. the problem is also that it is too simple for this problem. a federated broker would be able to handle only one task at a time. if the broker emulates a lock-stop client and worker, it is by definition also going to be lock-step, and if it has lots of available workers they won't be used. our brokers need to be connected in a fully asynchronous fashion.
+
+the federation model is perfect for other kinds of routing, especially service-oriented architectures(SOAs), which route by service name and proximity rather than load balancing or round robin. so don't dismiss it as useless, it's just not right for all use cases.
+
+#### Peering
+instead of federation, let's look at a peering approach in which brokers are explicitly aware of each other and talk over privileged channels. let's break this down, assuming we want to interconnect N brokers. each broker has (N-1) peers, and all brokers are suing exactly the same code and logic. there are two distinct flows of information between brokers:
+- each broker needs to tell its peer how many workers it has available at any time. this can be fairly simple information-just a quantity that is updated regularly. the obvious(and correct) socket pattern for this is pub-sub. so every broker opens a PUB socket and publish state information on that, and every broker also opens a SUB socket and connects that to the PUB socket of every other broker to get state information from its peers.
+- each broker needs a way to delegate tasks to a peer and get replies back, asynchronously. we'll do this using R OUTER sockets; no other combination works. each broker has two such sockets: one for tasks it receives and one for tasks it delegates. if we didn't use two sockets, it would be more work to know whether we were reading  a request or a reply each time. that would mean adding more information to the message envelope.
+
+and there is also the flow of information between a broker and its local clients and workers.
+
+### the Naming Ceremony
+Three flows X two sockets for each flow = six sockets that we have to manage in the broker. Choosing good names is vital to keeping a multi-socket juggling act reasonably coherent in our minds. Sockets do something and what they do should form the basis for their names. it's about being able to read the coe several weeks alter on a cold Monday morning before coffee, and not feel any pain. 
+
+let's do a  shamanistic naming ceremony for the sockets. the three flows are:
+- a local request-reply flow between the broker and its clients and works
+- a cloud request-reply flow between the broker and its peer brokers
+- a state flow between the broker and its peer broker.
+
+finding meaningful names that are all the same length means our code will align nicely. it's not a big thing, but attention to details helps. for each flow the broker has two sockets that we can orthogonally call the frontend and backend. we've used these names quite often. a frontend receives information or tasks. a backend sends those out to other peers. the conceptual flow is from front to back (with replies going  in the opposite direction from back to front).
+
+so in all the code we write for this tutorial, we will use these socket names:
+- `localfe` and `localbe` for the local flow
+- `cloudfe` and `cloudbe` for the cloud flow
+- `statefe` and `statebe` for the state flow
+
+for our transport and because we're simulating the whole thing on one box, we'll use `ipc` for everything. this has the advantage of working like tcp in terms of connectivity(i.e., it's a disconnected transport, unlike inproc), yet we don't need IP address ro DNS names, which would be a pain here. instead, we will use ipc endpoints called `something-local`, `something-cloud` and `something-state`, where something is the name of our simulated cluster.
+
+you might be thinking that this is a lot of work for some names. why not call them s1, s2, s3, s4 etc? the answer is that if you brain is not a perfect machine, you need a lot help when reading code, and we'll see that these names do help. it's easier to remember "three flows, two directions than six different sockets"
+
+![Broker socket arrangement](image-18.png)
+
+>NOTE what we connect the cloudbe in each broker to the cloudfe in every other broker, and likewise we connect the statebe in each broker to the statefe in every other broker
+
+### prototyping the state flow
+
 
 
 
