@@ -610,7 +610,78 @@ you might be thinking that this is a lot of work for some names. why not call th
 
 ### prototyping the state flow
 
+because each socket flow has its own little traps for the unwary, we will test them in real code one-by-one, rather than try to throw the whole lot into code in one go. when we're happy with each flow, we can put them together into a full program. we'll start with the state flow
+
+![The State Flow](image-19.png)
+
+here is how this works in code: `prototype_state_flow.php`
+
+>notes about this code
+- each broker has an identity that we use to construct ipc endpoint names. A real broker would need to work with TCP and a more sophisticated configuration scheme. we'll look at such schemes later in this book, but for now, using generated ipc names lets us ignore the problem of where to get TCP/IP addresses or names.
+- we use a `zmq_poll()` loop as the core of the program. this processes incoming messages and sends out state messages. we send a state message ONLY if we did NOT get any incoming messages and we waited for a second. if we send out a state message each time we get one in, we'll get message storms.
+- we use a two-part pub-sub message consisting of sender address and data. Note that we will need to know the address of the publisher in order to send it tasks, and the only way is to send this explicitly as a part of the message.
+- we don't set identities on subscribers because if we did then we'd get outdated state information when connecting to running brokers
+- we don't set a HWM on the publisher, but if we were using ZMQ v2.x that would be a wise idea.
+
+we can build this little program and run it three times to simulate three clusters. let's call them DC1, DC2 and DC3, we run these three commands, each in a separate window
+
+```bash
+# php prototype_state_flow.php DC1 DC2 DC3
+I: preparing broker at DC1...
+I: connecting to state backend at 'DC2' 
+I: connecting to state backend at 'DC3' 
+send random value for worker availability(5)
+DC2 - 8 workers free
+send random value for worker availability(5)
+DC2 - 8 workers free
+DC3 - 8 workers free
+send random value for worker availability(8)
+DC2 - 3 workers free
+DC3 - 7 workers free
+send random value for worker availability(2)
 
 
+# php prototype_state_flow.php DC2 DC1 DC3
+I: preparing broker at DC2...
+I: connecting to state backend at 'DC1' 
+I: connecting to state backend at 'DC3' 
+DC1 - 5 workers free
+send random value for worker availability(8)
+send random value for worker availability(8)
+DC1 - 5 workers free
+DC3 - 8 workers free
+send random value for worker availability(3)
+DC1 - 8 workers free
+DC3 - 7 workers free
+send random value for worker availability(1)
+
+# php prototype_state_flow.php DC3 DC1 DC2
+I: preparing broker at DC3...
+I: connecting to state backend at 'DC1' 
+I: connecting to state backend at 'DC2' 
+DC2 - 8 workers free
+send random value for worker availability(8)
+DC2 - 8 workers free
+DC1 - 5 workers free
+send random value for worker availability(7)
+DC2 - 3 workers free
+DC1 - 8 workers free
+send random value for worker availability(10)
+DC1 - 2 workers free
+DC2 - 1 workers free
+send random value for worker availability(3)
+
+```
+
+you'll see each cluster report the state of its peers, and after a few seconds they will all happily be printing random numbers once per second. try this and satisfy yourself that the three brokers all match up and synchronize to per-second state updates.
+
+![flow of state](image-21.png)
+
+
+
+### Prototyping the local and cloud Flows
+let's now prototype the flow of tasks via the local and cloud sockets. this code pulls requests from clients and then distributes them to local workers and cloud peers on a random basis.
+
+![The Flow of tasks](image-20.png)
 
 https://zguide.zeromq.org/docs/chapter3/
