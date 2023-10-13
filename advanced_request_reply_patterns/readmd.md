@@ -684,4 +684,54 @@ let's now prototype the flow of tasks via the local and cloud sockets. this code
 
 ![The Flow of tasks](image-20.png)
 
+before we jump into the code, which is getting a little complex, let's sketch the core routing logic and break it down into a simple yet robust design.
+
+we need two queues, one for requests from local clients and for requests from cloud clients. one option would be to pull messages off the local and cloud frontends, and pump these onto their respective queues. but this is kind of pointless because ZMQ sockets are queues already. so let's use the zmq socket buffers as queues.
+
+this was the technique we used in the load balancing broker, and it worked nicely. we only read from the two frontends when there is somewhere to send the requests. we can always read from the backends, as they give us replies to route back. as long as the backends aren't talking to us, there's no point in even looking at the frontends.
+
+so our main loop becomes:
+- poll the backends fro activity. when we get a message, it may be "ready" from a worker or it may be a reply. if it's a reply, route back via the local or cloud frontend.
+- if a worker replied, it became available, so we queue it and count it.
+- while there are workers available, take a request, if any, from either frontend and route to a local worker, or randomly, to a cloud peer.
+
+randomly sending tasks to a peer broker rather than a worker simulates work distribution across the cluster. it's dumb, but that is fine for this stage.
+
+we use broker identities to route messages between brokers. each broker has a name that we provide on the command line in this simple prototype. as long as these names don't overlap with the zmq-generated UUIDs used for client nodes, we can figure out whether to route a reply back to a client or to a broker.
+
+here is how this works in code. the interesting part starts around the comment "interesting part"
+
+`prototype_local_cloud_flow.php`
+
+run this by, for instance, starting two instances of the broker in two windows:
+`php prototype_local_cloud_flow.php you me`
+`php prototype_local_cloud_flow.php me you`
+
+some comments on this code:
+- in the C code at least, using the zmsg class makes life much easier, and our code much shorter. ti's obviously an abstraction that works. if you build zmq application in C, you should use CZMQ
+- because we're not getting any state information from peers, we naively assume they are running. the code prompts you to confirm when you've started all the brokers. in the real case, we'd not send anything to brokers who had not told use they exist.
+
+you can satisfy yourself that the code works by watching it run forever. if there were any mis-routed messages, clients would end up blocking, and the brokers would stop printing trace information. you can prove that by killing either of the brokers. the other broker tries to send requests to the cloud, and one-by-one its clients block, waiting for an answer.
+
+
+### putting it all together
+let's put this together into a single package. as before, we'll run an entire cluster as one process. we're going to take the two previous examples and merge them into one properly working design that lets you simulate any nbumber of cluster.
+
+this code is the size of both previous prototypes together, at 270LoC. that's pretty good for a simulation of a cluster that includes clients and workers and cloud workload distribution.
+
+`full-cluster-simulation.php`
+
+it's nontrivial program and took about a day to get working. these are the highlights
+- the client threads detect and repot a failed request. they do this by polling for a response and if noe arrives after a while(10 sec), print an error msg
+- client threads don't print directly, but instead send a message to a monitor socket(PUSH) that the main loop collects(PULL) and prints off. this is the first case we've seen of using zmq socket for monitoring and logging; this is a big use case that we'll come back to later
+- clients simulate varying loads to get the cluster 100% at random moments, so that tasks are shifted over to the coud. the number of clients and workers, and delays in the client and worker threads control this. feel free to play with them to see if you can make a more realistic simulation.
+- the main loop uses two pollsets. it could in face use three: information, backends and frontends. as in the earlier prototype, there is no point in talking a frontend msg if there is no backend capacity
+
+there are some of the problems that arose during developemnt of this program:
+- clients would freeze, due to requests or replies geting lost somewhere. recall that the ROUTER socket drops messages it can't route. the first tractic there was to modify the client thread to detect and report such problems. secondly, i put `zmsg_dump()` calls after every receive and before every send in the main loop, until the origin of the problems was clear
+- the main loop was mistakenly reading from more than one ready socket. this caused the first message to be lost. i fixed that by reading only from the frist ready socket
+- the zmsg class was not properly encoding UUIDs as C strings. this caused UUIDs that contain 0 bytes to be corrupted. ifixed that by modifying zsmsg to encodue UUIDs as printable hex strings.
+
+this simulation does not detect disappearance of a cloud peer. if you start several peers and stop one, and it was broadcasting capacity to the others, they will continue to send it work even if it's gone. you can try this, and you will get clients that complain of lost requests, the solution is twofold: first: only keep the capacity information for a short time so that if a peer does disappear, its capacity is quickly set to zero. second, add reliability to the request-reply. we'll look reliability int he next chapter.
+
 https://zguide.zeromq.org/docs/chapter3/

@@ -26,7 +26,7 @@ function client_task()
     // generate printable identity for the client
     $identity = sprintf("%04X", rand(0, 0x10000));
     $client->setSockOpt(ZMQ::SOCKOPT_IDENTITY, $identity);
-    $client->connect("tcp://localhost:5572");
+    $client->connect("tcp://localhost:5573");
 
     $read = $write = array();
     $poll = new ZMQPoll();
@@ -73,7 +73,7 @@ function server_task()
 
     // frontend socket talks to clients over TCP
     $frontend = new ZMQSocket($context, ZMQ::SOCKET_ROUTER);
-    $frontend->bind("tcp://*:5572");
+    $frontend->bind("tcp://*:5573");
 
     // backend socket talks to workers over ipc
     $backend = new ZMQSocket($context, ZMQ::SOCKET_DEALER);
