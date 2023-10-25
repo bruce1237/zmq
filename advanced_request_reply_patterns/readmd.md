@@ -231,7 +231,7 @@ it's a twist on request-reply because the task is sent with the reply, and any r
 
 `router-to-req.php`
 
-the `router-to-requ.php` runs for five seconds and then each worker prints how many tasks they handled. if the routing worked, we'd expect a fair distribution of work:
+the `router-to-req.php` runs for five seconds and then each worker prints how many tasks they handled. if the routing worked, we'd expect a fair distribution of work:
 ```text
 processed 8 tasks
 processed 13 tasks

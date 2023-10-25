@@ -1,21 +1,37 @@
 <?php
-$context = new ZMQContext();
-$client = $context->getSocket(ZMQ::SOCKET_REQ);
-$client->connect("ipc://brokerW.ipc");
+    $context = new ZMQContext();
+    $worker = $context->getSocket(ZMQ::SOCKET_REQ);
+    $worker->connect("tcp://localhost:5556");
 
-$client->send("READY");
-echo "send READY\n";
-
-
-for ($i=0; $i<10; $i++){
-    echo "seding...\n";
-    $result = $client->recv();
-    printf("got result from worker:%s%s",$result, PHP_EOL);
+    //  Tell broker we're ready for work
+    $worker->send("READY");
+    echo "W: send READY\n";
 
 
-    $client->send("task: {$i}");
-    printf("sending task%s%s", $i, PHP_EOL);
+    while (true) {
+        //  Read and save all frames until we get an empty frame
+        //  In this example there is only 1 but it could be more
+        $address = $worker->recv();
+        echo "W: receive Address: {$address}\n";
 
-    
 
-}
+        // Additional logic to clean up workers.
+        if ($address == "END") {
+            exit();
+        }
+        $empty = $worker->recv();
+        echo "W: received delimiter\n";
+
+
+        //  Get request, send reply
+        $request = $worker->recv();
+        echo "W: received request: {$request}\n";
+
+
+        $worker->send($address, ZMQ::MODE_SNDMORE);
+        $worker->send("", ZMQ::MODE_SNDMORE);
+        $worker->send("OK");
+
+        echo "W: send OK as response\n";
+
+    }
