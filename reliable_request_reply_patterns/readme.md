@@ -126,4 +126,14 @@ the simple pirate queue pattern works pretty well, especially because it's just 
 
 we'll fix these in a properly pedantic paranoid pirate pattern.
 
+we previously used a REQ socket for the worker. for the paranoid pirate worker, we'll switch to a DEALER socket. this has the advantage of letting us send and receive messages at any time. rather than the lock-stop send/receive that REQ imposes. the downside of DEALER is that we have to do our own envelope management
+
+we're still using the lazy pirate client, here is the paranoid priate queue proxy:
+
+`paranoid_pirate_queue.php`
+
+the queue extends the load balancing pattern with heartbeating of workers. heartbeating is one of those "simple" things that can be difficult to get right. 
+
+`paranoid_pirate_worker.php`
+
 https://zguide.zeromq.org/docs/chapter4/
