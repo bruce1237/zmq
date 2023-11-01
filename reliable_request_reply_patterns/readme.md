@@ -136,4 +136,122 @@ the queue extends the load balancing pattern with heartbeating of workers. heart
 
 `paranoid_pirate_worker.php`
 
+
+some comments about this example
+- the code includes simulation of failures, as before. this makes it (a) very hard to debug, (b) dangerous to reuse. when you want to debug this, disable the failure simulation
+- the worker uses a reconnect strategy similar to the one we designed for the Lazy Pirate client, with two major differences: (a) it does an exponential back-off, and (b) it retries indefinitely (whereas the client retries a few times before reporting a failure).
+
+try the client, queue, and workers, such as by using a script like this:
+```bash
+paranoid_pirate_queue.php
+
+for i in 1 2 3 4; do
+    paranoid_pirate_worker.php
+    sleep 1
+done
+lazy_pirate_client.php
+```
+
+you should see the workers die one-by-one as they simulate a crash, and the client eventually give up. you can stop and restart the queue and both client and workers will reconnect and carry on. and no matter what you do to queues and workers, the client will never get an out-of-order reply: the whole chain either works, or the client abandons.
+
+## Heartbeating
+heartbeating solves the problem of knowing whether a peer is alive or dead. this is not an issue specific to zmq, TCP has a long timeout (30 minutes or so), that means that it can be impossible to know whether a peer has died, been disconnected, or gone on  a weekend to Prague with a case of vodka, a readhead, and a large expense account.
+
+it's not easy to get heartbeating right. when writing the paranoid pirate examples, it took about five hours to get the heartbeating working properly. the rest of the request-reply chain took perhaps then minutes. it is especially easy to create "false failures", i.e., when peers decided that they are disconnected because the heartbeats aren't sent properly.
+
+we'll look at the three main answers people use for heartbeating with zmq.
+
+### Shrugging it off
+the most common approach is to do no heartbeating at all and hope for the best. may if not most zmq applications do this.  zmq encourages this by hiding peers in many cases. what problems does this approach cause?
+- when we use a ROUTER socket in an application that tracks peers, as peers disconnect and reconnect, the application will leak memory(resources that the application holds for each peer) and get slower and slower
+- when we use SUB- or DEALER- based data recipients, we can't tell the difference between good silence(there's no data) and bad silence(the other end died). when a recipient knows the other side died, it can for example switch over to a backup route.
+- if we use a TCP connection that stays silent for a long while, it will, in some networks, just die. sending something(technically, a keep-alive more than a heartbeat), will keep the network alive.
+
+### one way heartbeats
+a second option  is to send a heartbeat message from each node to its peers every second or so. when one node hears nothing from another within some timeout(several seconds, typically), it will treat that peer as dead. sounds good, right? sadly, no. this works in some cases but has nasty edge cases in others.
+
+for pub-sub, this does work, and it's the only model you can use. SUB sockets can not talk back to PUB sockets, but PUB sockets can happily send "i'm alive" message to their subscribers.
+
+as an optimization, you can send heartbeats only when there is no real data to send. furthermore, you can send heartbeats progressively slower and slower, if network activity is an issue(e.g., on mobile networks where activity drains the battery). as long as the recipient can detect a failure(sharp stop in activity), that't fine.
+
+here are the typical problem with this design:
+- it can be inaccurate when we send large amounts of data, was heartbeats will be delayed behind that data. if heartbeats are delayed, you can get false timeout and disconnections due to network congestion. thus, always treat any incoming data as a heartbeat, whether or not the sender optimizes out heartbeats
+- while the pub-sub pattern will drop messages for disappeared recipients, PUSH and DEALER sockets will queue them. so if you send heartbeats to a dead peer and it comes back, it will get all the heartbeats you sent, which can be thousands.
+- this design assume that heartbeat timeouts are the same across thw whole network. but that won't be accurate. some peers will want every aggressive heartbeating in order to detect faults rapidly. and some will want very relaxed heartbeating, in order to let sleeping networks lie and save power.
+
+### Ping-Pong heartbeats
+the third option is to use a ping-pong dialog. one peer sends a ping command to the other, which replies with a pong command. neither command ahs any payload. pings and pongs are not correlated. because the roles of "client" and "server" are arbitrary in some networks, we usually specify that either peer can in fact send a ping and expect a pong in response. however, because the timeouts depend on network topologies known best to dynamic clients, it is usually the client that pings the server.
+
+this works for all ROUTER-based brokers. the same optimizations we used in the second model make this work even better: treat any incoming data as a pong, and only send  a ping when not otherwise sending data.
+
+### heartbeating for paranoid pirate
+
+for paranoid pirate, we chose the second approach. it might not have been the simplest option: if designing this today. i'd probably try a ping-pong approach instead. however the principles are similar. the heartbeat messages flow asynchronously in both directions, and either peer can decide the other is "dead" and stop talking to it.
+
+in the worker, this is how we handle heartbeats from the queue
+- we calculate a liveness, which is how many heartbeats we can still misss before deciding the queue is dead. it starts at three and we decrement it each time we miss a heartbeat.
+- we wait, in the zmq_poll loop, for one second each time, which is our heartbeat interval.
+- if there's any message from the queue during that time, we reset our liveness to three.
+- if there's no message during that time, we count down our livenes.
+- if the liveness reaches zero, we consider the queue dead.
+- if the queue is dead, we destory our socket, create a new one, and reconnect.
+- to avoid opening and closing too many socktes, we wait for a certain interval before reconnecting, and we double the interval each time until it reaches 32 seconds
+
+and this is how we handle heartbeats to the queue:
+- we calculate when to send the next heartbeat; this is a single variable because we're talking to one peer, the queue
+- in the zmq_poll loop, whenever we pass this time, we send a heartbeat to the queue
+
+here's the essential heartbeating code for the worker:
+
+```c
+#define HEARTBEAT_LIVENESS 3    // 3-5 is reasonable
+#define HEARTBEAT_INTERVAL 1000 // msecs
+#define INTERVAL_INIT   1000    //initial reconnect
+#define INTERVAL_MAX    32000   // after exponential backoff
+
+// if liveness hits zero, queue is considered disconnected
+size_t liveness = HEARTBEAT_LIVENESS;
+size_t interval = INTERVAL_INIT;
+
+// send out heartbeats at regular intervals
+uint64_t heartbeat_at = zclock_time() + HEARTBEAT_INTERVAL;
+while(true) {
+    zmq_pollitem_t items [] = {{ worker, 0, ZMQ_POLLIN, 0}};
+    int rc = zmq_poll (items, 1, HEARTBEAT_INTERVAL * ZMQ_POLL_MESC);
+
+    if (items [0].revents & ZMQ_POLLIN) {
+        // receive any message from queue
+        liveness = HEATBEAT_LIVENESS;
+        interval = INTERVAL_INIT;
+    } else {
+        if(--liveness == 0){
+            zclock_sleep(interval);
+
+            if(interval < INTERVAL_MAX){
+                interval *=2;
+            }
+            zsocket_destory(ctx, worker);
+            ...
+            liveness = HEARTBEAT_LIVENESS;
+        }
+        // send heartbeat to queue if it's time
+        if(zclock_time() > heartbeat_at){
+            heartbeat_at = zclock_time() + HEARTBEAT_INTERVAL;
+            // send hearbeat message to queue
+        }
+    }
+}
+```
+the queue does the same, but manages an expiration time for each worker.
+here are some tips for your won heartbeating implementation:
+- use zmq_poll or a reactor as the core of your application's main task
+- start by building the heartbeating between peers, test it by simulating failures, and then build the rest of the mesage flow. adding heartbeating afterwards in much trickier
+- use simple tracing, i.e., print to console, to get this working. to help you trace the flow of messages between peers, use a dump method such as zmsg offers, and number your messages incrementally so you can see if there are gaps.
+- in a real application, heartbeating must be configurable and usually negotiated with the peer, some peers will want aggressive heartbeating, as low as 10  msecs. other peers will be far away and want heartbeating as hight as 30 seconds.
+- if you have different heatbeat intervals for different peers, you poll timeout should be the lowest(shortest time) of these. do not use an infinite timeout
+- do heartbeating on the same socket you sue for messages, so your heartbeats also act as a keep-alive to stop the network connection from going stale(some firewalls can be unkind to silent connections).
+
+### contracts and protocols
+if you are paying attention, you'll realize that paranoid pirate is not interoperable with simple pirate, because of the heartbeats. but how do we define "interoperable"? to guarantee interoperability, we need a kind of contract, an agreement that lets different teams in different times and places write code that is guaranteed to work together. we call this a "protocol".
+
 https://zguide.zeromq.org/docs/chapter4/
