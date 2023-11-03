@@ -254,4 +254,49 @@ here are some tips for your won heartbeating implementation:
 ### contracts and protocols
 if you are paying attention, you'll realize that paranoid pirate is not interoperable with simple pirate, because of the heartbeats. but how do we define "interoperable"? to guarantee interoperability, we need a kind of contract, an agreement that lets different teams in different times and places write code that is guaranteed to work together. we call this a "protocol".
 
+it's fun to experiment without specifications, but that's not a sensible basis for real applications. what happens if we want to write a worker in another language? do we have to read code to see how things work? what if we want to change the protocol for some reason? even a simple protocol will, if ti's successful, evolve and become more complex.
+
+lack of contract is a sure sign of a disposable application. so let's write a contract for this protocol. how do we do that?
+
+there's a wiki at rfc.zeromq.org that we made especially as a home for public zmq contracts. to create a new specification, register on the wiki if needed, and the follow the instructions. it's fairly straightforward, though writing technical texts is not everyone's cup of tea.
+
+it took me about fifteen minutes to draft the pirate pattern protocol. it's not a big specification, but it does capture enough to act as the basis for arguments("you queue isn't PPP compatible, please fit it!")
+
+turning PPP into a real protocol would take more work:
+- there should be a protocol version number in the READY command so that  it's possible to distinguish between different versions of PPP
+
+- right now, READY and HEARTBEAT are not entirely distinct from requests and replies. to make them distinct, we would need a message structure that includes a message type part.
+
+### service-oriented reliable queuing (Majordomo pattern)
+![The Majordomo pattern](image-3.png)
+
+the nice thing about progress is how fast it happens when lawyers and committees aren't involved. the one-page MDP specification turns PPP into something more solid. this is how we should design complex architectures: start by writing down the contracts and only then write software to implement them.
+
+the Majordomo protocol (MDP) extends and improves on PPP in one interesting way: it adds a "service name" to requests that the client sends and asks workers to register for specific services. adding service names turns our paranoid pirate queue into a service-oriented broker. the nice thing about MDP is that it came out of working code, a simple ancestor protocol(PPP), and a precise set of improvements that each solved a clear problem. this make it easy to draft. 
+
+to implement Majordomo, we need to write a framework for clients and workers. ti's really not sane to ask every application developer to read the spec and make it work, when they could be using a simpler API that does the work for them.
+
+so while our first contact(MDP itself) defines how the pieces of our distributed architecture talk to each other, our second contract defines how user applications talk to the technical framework we're going to design.
+
+Majordomo has tow halves, a client side and a worker side. because we'll wirte both client and worker applications, we will need two APIs. here is a sketch for the client API, using a simple object-oriented approach:
+
+```c
+mdcli_t     *mdcli_new      (char *broker);
+void        mdwrk_destory   (mdwrk_t **self_p);
+zmsg_t      *mdwrk_recv     (mdwrk_t *self, zmsg_t *reply);
+```
+that's it, we open a session to the broker, send a request message, get a reply message back, and eventually close the connection. 
+here's a sketch for the worker API:
+```c
+mdwrk_t     *mdwrk_new      (char *broker, char *service);
+void        mdwrk_destroy   (mdwrk_t **self_p);
+zmsg_t      *mdwrk_recv     (mdwrk_t *self, zmsg_t *reply);
+```
+it's more or less symmetrical, but the worker dialog is a little different. the first time a worker does a recv(), it passes a null reply. thereafter, it passes the current reply, and gets a new request.
+
+the client and worker APIs were fairly simple to construct because the're heavily based on the paranoid pirate code we already developed. here is the client API:
+`majordomo_client_api.php`
+
+
+
 https://zguide.zeromq.org/docs/chapter4/
