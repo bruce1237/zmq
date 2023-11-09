@@ -297,6 +297,12 @@ it's more or less symmetrical, but the worker dialog is a little different. the 
 the client and worker APIs were fairly simple to construct because the're heavily based on the paranoid pirate code we already developed. here is the client API:
 `majordomo_client_api.php`
 
+let's see how the client API looks in action, with an example test program that does 100K request-reply cycles:
+`majordomo_client_application.php`
 
+and here is the worker API
+`majordomo_worker_api.php`
 
 https://zguide.zeromq.org/docs/chapter4/
+
+php zmq repo: https://github.com/booksbyus/zguide/blob/master/examples/PHP/mdp.php
